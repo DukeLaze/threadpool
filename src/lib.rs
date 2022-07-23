@@ -1,7 +1,7 @@
 use std::{
     sync::{
         mpsc::{channel, Receiver, Sender},
-        Arc, Mutex, atomic::{AtomicBool, self},
+        Arc, Mutex, atomic::{AtomicBool, self, AtomicI32},
     },
     thread::{self, JoinHandle, sleep}, time::Duration,
 };
@@ -38,19 +38,13 @@ impl Worker {
             
             match message {
                 MessageToWorker::Work(job) => {
-                    println!("Worker {} got a job; executing.", id);
-
                     job.run();
                 }
                 MessageToWorker::WorkNotify(job, token) => {
-                    println!("Worker {} got a async job; executing.", id);
-                    
                     job.run();
                     token.swap(true, atomic::Ordering::Relaxed);
                 }
                 MessageToWorker::Stop => {
-                    println!("Worker {} was told to terminate.", id);
-
                     break;
                 }
             }
@@ -68,7 +62,7 @@ pub struct ThreadPool {
     sender: Sender<MessageToWorker>,
 }
 
-// TODO: Add "awaitable" tasks, opaque "ticket" and new message type with response?
+// TODO: Add future/task support? FnMut(T) -> Task<U>
 impl ThreadPool {
     pub fn new(number_of_workers: usize) -> Self {
         let (sender, rec) = channel();
@@ -115,6 +109,24 @@ impl ThreadPool {
         }
     }
 
+    pub fn run_many_await<T>(&mut self, funcs: Vec<T>)
+    where
+    T: FnMut() + Send + 'static,
+    {
+        let mut finished: Vec<Arc<AtomicBool>> = Vec::new();
+        for func in funcs {
+            let func_finished = Arc::new(AtomicBool::new(false));
+            self.sender
+                .send(MessageToWorker::WorkNotify(Box::new(func), func_finished.clone()))
+                .unwrap();
+            finished.push(func_finished);
+        }
+        while !Iterator::all(&mut finished.iter(), |x| {
+            x.load(atomic::Ordering::Relaxed)
+        }) {
+            sleep(Duration::from_millis(1));
+        }
+    }
 
 }
 
@@ -130,4 +142,24 @@ impl Drop for ThreadPool {
             }
         }
     }
+}
+
+#[test]
+pub fn run_many_await_is_sequential_at_call_site() {
+    let mut pool = ThreadPool::new(4);
+    let mut tasks = Vec::new();
+    let count = 100;
+
+    let mut_me = Arc::new(AtomicI32::new(0));
+    for _ in 0..count {
+        let clone = mut_me.clone();
+        let task = move || {
+            clone.fetch_add(1, atomic::Ordering::Relaxed);
+        };
+        tasks.push(task);
+    }
+    pool.run_many_await(tasks);
+    assert!(mut_me.load(atomic::Ordering::Relaxed) == count);
+    mut_me.fetch_add(1, atomic::Ordering::Relaxed);
+    assert!(mut_me.load(atomic::Ordering::Relaxed) == count + 1)
 }
